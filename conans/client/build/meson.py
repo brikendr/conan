@@ -7,7 +7,7 @@ from conans.client.build import defs_to_string, join_arguments
 from conans.client.build.autotools_environment import AutoToolsBuildEnvironment
 from conans.client.build.cppstd_flags import cppstd_from_settings
 from conans.client.tools.env import environment_append, _environment_add
-from conans.client.tools.oss import args_to_string
+from conans.client.tools.oss import args_to_string, get_build_os_arch
 from conans.errors import ConanException
 from conans.model.build_info import DEFAULT_BIN, DEFAULT_INCLUDE, DEFAULT_LIB
 from conans.model.version import Version
@@ -18,19 +18,20 @@ from conans.util.runners import version_runner
 
 class Meson(object):
 
-    def __init__(self, conanfile, backend=None, build_type=None, append_vcvars=False):
+    def __init__(self, conanfile, backend=None, build_type=None, append_vcvars=False, exe_wrapper=None):
         """
         :param conanfile: Conanfile instance (or settings for retro compatibility)
         :param backend: Generator name to use or none to autodetect.
                Possible values: ninja,vs,vs2010,vs2015,vs2017,xcode
         :param build_type: Overrides default build type comming from settings
+        :param exe_wrapper: Tells meson what exe wrapper to use eg wine
         """
         self._conanfile = conanfile
         self._settings = conanfile.settings
         self._append_vcvars = append_vcvars
-
+        self.exe_wrapper='false'
+        self.exe_wrapper = exe_wrapper or self.exe_wrapper
         self._os = self._ss("os")
-
         self._compiler = self._ss("compiler")
         if not self._compiler:
             conan_v2_behavior("compiler setting should be defined.",
@@ -129,9 +130,118 @@ class Meson(object):
     def flags(self):
         return defs_to_string(self.options)
 
+    def _configure_cross_compile(self, cross_filename, environ_append):
+
+        arm=('arm','arm','little')
+        cpu_translate = {
+            'x86' : ('x86', 'x86', 'little'),
+            'x86_64' : ('x86_64', 'x86_64', 'little'),
+            'x86' : ('x86','x86','little'),
+            'ppc32be' : ('ppc','ppc','big'),
+            'ppc32' : ('ppc','ppc','little'),
+            'ppc64le' : ('ppc64','ppc64','little'),
+            'ppc64' : ('ppc64','ppc64','big'),
+            'armv4' : arm,
+            'armv4i' : arm,
+            'armv5el' : arm,
+            'armv5hf' : arm,
+            'armv6' : arm,
+            'armv7' : arm,
+            'armv7hf' : arm,
+            'armv7s' : arm,
+            'armv7k' : arm,
+            'armv8_32' : arm,
+            'armv8' : ('aarch64', 'aarch64', 'little'),
+            'armv8.3' : ('aarch64', 'aarch64', 'little'),
+            'sparc' : ('sparc','sparc','big'),
+            'sparcv9' : ('sparc64','sparc64','big'),
+            'mips' : ('mips','mips','big'),
+            'mips64' : ('mips64','mips64','big'),
+            'avr' : ('avr','avr','little'),
+            's390' : ('s390','s390','big'),
+            's390x' : ('s390','s390','big'),
+            'wasm' : ('wasm','wasm','little'),
+        }
+        if hasattr(self._conanfile,'settings_build'):
+            build_cpu_family, build_cpu, build_endian = cpu_translate[str(self._conanfile.settings_build.arch)]
+            os_build, _ = get_build_os_arch(self._conanfile)
+
+        os_host = str(self._conanfile.settings.os).lower()
+        cpu_family, cpu, endian = cpu_translate[str(self._conanfile.settings.arch)]
+
+        cflags = ', '.join(repr(x) for x in os.environ.get('CFLAGS', '').split(' '))
+        cxxflags = ', '.join(repr(x) for x in os.environ.get('CXXFLAGS', '').split(' '))
+
+        cc = os.environ.get('CC', 'cc')
+        cpp = os.environ.get('CXX', 'c++')
+        ld = os.environ.get('LD', 'ld')
+        ar = os.environ.get('AR', 'ar')
+        strip = os.environ.get('STRIP', 'strip')
+        ranlib = os.environ.get('RANLIB', 'ranlib')
+        libdir = environ_append['PKG_CONFIG_PATH']
+
+        with open(cross_filename, "w") as fd:
+            if hasattr(self._conanfile,'settings_build') :
+                fd.write("""
+                    [build_machine]
+                    system = '{os_build}'
+                    cpu_family = '{build_cpu_family}'
+                    cpu = '{build_cpu}'
+                    endian = '{build_endian}'
+                """.format(
+                    os_build = os_build.lower(),
+                    build_cpu_family = build_cpu_family,
+                    build_cpu = build_cpu,
+                    build_endian = build_endian,
+                ))
+            fd.write("""
+                [host_machine]
+                system = '{os_host}'
+                cpu_family = '{cpu_family}'
+                cpu = '{cpu}'
+                endian = '{endian}'
+
+                [properties]
+                needs_exe_wrapper = '{exe_wrapper}'
+                cpp_args = [{cxxflags}]
+                c_args = [{cflags}]
+                pkg_config_libdir='{libdir}'
+
+                [binaries]
+                c = '{cc}'
+                cpp = '{cpp}'
+                ar = '{ar}'
+                ld = '{ld}'
+                strip = '{strip}'
+                ranlib = '{ranlib}'
+                pkgconfig = 'pkg-config'
+                """.format(
+                    os_host = os_host,
+                    cpu_family = cpu_family,
+                    cpu = cpu,
+                    endian = endian,
+                    exe_wrapper = self.exe_wrapper,
+                    cxxflags = cxxflags,
+                    cflags = cflags,
+                    libdir = libdir,
+                    cc = cc,
+                    cpp = cpp,
+                    ar = ar,
+                    ld = ld,
+                    strip = strip,
+                    ranlib = ranlib,
+                ))
+        environ_append.update({'CC': None,
+                               'CXX': None,
+                               'CFLAGS': None,
+                               'CXXFLAGS': None,
+                               'CPPFLAGS': None,
+                               'LDFLAGS':None,
+                               })
+
     def configure(self, args=None, defs=None, source_dir=None, build_dir=None,
                   pkg_config_paths=None, cache_build_folder=None,
-                  build_folder=None, source_folder=None):
+                  build_folder=None, source_folder=None,no_generated_cross_file=None):
         if not self._conanfile.should_configure:
             return
         args = args or []
@@ -158,14 +268,23 @@ class Meson(object):
               "Release": "release"}.get(str(self.build_type), "")
 
         build_type = "--buildtype=%s" % bt
+        cross_option = None
+        environ_append = {"PKG_CONFIG_PATH": pc_paths}
+        if tools.cross_building(self._conanfile.settings):
+            if not no_generated_cross_file:
+                cross_filename = os.path.join(self.build_dir, "cross_file.txt")
+                cross_option = "--cross-file=%s" % cross_filename
+                self._configure_cross_compile(cross_filename, environ_append)
+
         arg_list = join_arguments([
+            cross_option,
             "--backend=%s" % self.backend,
             self.flags,
             args_to_string(args),
-            build_type
+            build_type,
         ])
         command = 'meson "%s" "%s" %s' % (source_dir, self.build_dir, arg_list)
-        with environment_append({"PKG_CONFIG_PATH": pc_paths}):
+        with environment_append(environ_append):
             self._run(command)
 
     @property
